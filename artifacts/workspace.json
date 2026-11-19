@@ -1,0 +1,17 @@
+{
+  "root": "/home/dev/feedback/uid28723",
+  "B": "/home/dev/feedback/uid28723",
+  "sha": "1d23ebc04713256e5c7e39fb6644754381aa122a",
+  "wslDistro": "Ubuntu-26.04",
+  "source": {
+    "owner": "wbond",
+    "repo": "asn1crypto",
+    "sha": "1d23ebc04713256e5c7e39fb6644754381aa122a"
+  },
+  "fork": {
+    "owner": "Rrr119",
+    "repo": "asn1crypto",
+    "cloneUrl": "https://github.com/Rrr119/asn1crypto.git"
+  },
+  "at": "2026-11-19T20:12:10.222Z"
+}

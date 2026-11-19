@@ -163,7 +163,7 @@ def test_classes():
         )
 
     from .test_algos import AlgoTests
-    from .test_cms import CMSTests
+    from .test_cms import CMSSignatureVerificationTests, CMSTests
     from .test_crl import CRLTests
     from .test_csr import CSRTests
     from .test_init import InitTests
@@ -179,6 +179,7 @@ def test_classes():
 
     return [
         AlgoTests,
+        CMSSignatureVerificationTests,
         CMSTests,
         CRLTests,
         CSRTests,

@@ -21,6 +21,10 @@ Most CMS structures in the wild are formatted as ContentInfo encapsulating one o
 
 from __future__ import unicode_literals, division, absolute_import, print_function
 
+import hashlib
+import hmac
+from datetime import datetime
+
 try:
     import zlib
 except (ImportError):
@@ -52,15 +56,78 @@ from .core import (
     SetOf,
     UTCTime,
     UTF8String,
+    Void,
 )
 from .crl import CertificateList
 from .keys import PublicKeyInfo
 from .ocsp import OCSPResponse
+from ._types import byte_cls, int_types
+from .util import timezone
 from .x509 import Attributes, Certificate, Extensions, GeneralName, GeneralNames, Name
 
 
 # These structures are taken from
 # ftp://ftp.rsasecurity.com/pub/pkcs/ascii/pkcs-6.asc
+
+
+class CMSVerificationError(ValueError):
+    """
+    Raised when a CMS signature, certificate chain or timestamp can not be
+    verified.
+    """
+
+
+class CMSTimestampVerificationResult(object):
+    """
+    The result of verifying an RFC 3161 timestamp token.
+    """
+
+    def __init__(self, gen_time, policy, serial_number, tsa, tst_info, signed_data,
+                 signer_certificate, certificate_chain):
+        self.gen_time = gen_time
+        self.policy = policy
+        self.serial_number = serial_number
+        self.tsa = tsa
+        self.tst_info = tst_info
+        self.signed_data = signed_data
+        self.signer_certificate = signer_certificate
+        self.certificate_chain = certificate_chain
+
+
+class CMSSignerVerificationResult(object):
+    """
+    The result of verifying a single CMS SignerInfo.
+    """
+
+    def __init__(self, signer_info, certificate, certificate_chain, timestamp, verification_time):
+        self.signer_info = signer_info
+        self.certificate = certificate
+        self.certificate_chain = certificate_chain
+        self.timestamp = timestamp
+        self.verification_time = verification_time
+
+
+class CMSSignedDataVerificationResult(object):
+    """
+    The result of verifying all SignerInfo structures in a SignedData object.
+    """
+
+    def __init__(self, signers):
+        self.signers = signers
+
+    @property
+    def timestamp(self):
+        """
+        :return:
+            The timestamp of the first signer that has a verified timestamp,
+            or None
+        """
+
+        for signer in self.signers:
+            if signer.timestamp is not None:
+                return signer.timestamp
+        return None
+
 
 class ExtendedCertificateInfo(Sequence):
     _fields = [
@@ -613,6 +680,97 @@ class SignerInfo(Sequence):
         ('unsigned_attrs', CMSAttributes, {'implicit': 1, 'optional': True}),
     ]
 
+    def find_certificate(self, certificates):
+        """
+        Finds the certificate identified by the SignerIdentifier.
+
+        :param certificates:
+            An iterable of Certificate, CertificateChoices, cryptography
+            Certificate objects or DER/PEM byte strings
+
+        :raises:
+            CMSVerificationError - when no matching certificate is present
+
+        :return:
+            An asn1crypto.x509.Certificate object
+        """
+
+        return _find_signer_certificate(self, _load_certificates(certificates)).asn1
+
+    def verify_timestamp(self, trust_store=None, extra_certs=None, timestamp_trust_store=None):
+        """
+        Verifies the RFC 3161 timestamp token in the unsigned attributes and
+        that its message imprint covers this SignerInfo's signature.
+
+        :param trust_store:
+            None, or a certificate or iterable of certificates to use as trust
+            anchors when verifying the timestamp signer's certificate chain
+
+        :param extra_certs:
+            None, or a certificate or iterable of additional certificates to
+            use while building the timestamp signer's certificate chain
+
+        :param timestamp_trust_store:
+            None, or a certificate or iterable of certificates to use as trust
+            anchors for the timestamp signer. When not None, this takes
+            precedence over trust_store.
+
+        :raises:
+            CMSVerificationError - when the timestamp is missing or invalid
+
+        :return:
+            A CMSTimestampVerificationResult object, or None if the SignerInfo
+            does not contain a timestamp
+        """
+
+        values = _attribute_values(self['unsigned_attrs'], 'signature_time_stamp_token')
+        if not values:
+            return None
+
+        if len(values) != 1:
+            raise CMSVerificationError('SignerInfo contains more than one timestamp token')
+
+        anchors = timestamp_trust_store if timestamp_trust_store is not None else trust_store
+        return _verify_timestamp_token(self, values[0], anchors, extra_certs)
+
+    def verify(self, certificates, content, trust_store=None, extra_certs=None, verification_time=None):
+        """
+        Verifies the content digest and signature of this SignerInfo.
+
+        The certificate chain is verified when trust_store is not None.
+
+        :param certificates:
+            An iterable of candidate signer certificates
+
+        :param content:
+            The signed content as a byte string
+
+        :param trust_store:
+            None, or a certificate or iterable of trust anchors
+
+        :param extra_certs:
+            None, or additional certificates to use while building the chain
+
+        :param verification_time:
+            None, a datetime or a POSIX timestamp at which to validate the
+            certificate chain
+
+        :raises:
+            CMSVerificationError - when verification fails
+
+        :return:
+            A CMSSignerVerificationResult object
+        """
+
+        candidates = _load_certificates(certificates)
+        certificate = _find_signer_certificate(self, candidates)
+        _verify_signer_crypto(self, certificate, content)
+        effective_time = _normalize_verification_time(verification_time)
+        chain = _verify_certificate_chain(certificate, candidates, trust_store, effective_time)
+        return CMSSignerVerificationResult(self, certificate.asn1, chain, None, effective_time)
+
+    verify_signature = verify
+
 
 class SignerInfos(SetOf):
     _child_spec = SignerInfo
@@ -645,6 +803,177 @@ class SignedData(Sequence):
     _spec_callbacks = {
         'encap_content_info': _encap_content_info_spec
     }
+
+    def verify(self, content=None, trust_store=None, extra_certs=None, verification_time=None,
+               require_timestamp=False, verify_timestamp=True, timestamp_trust_store=None,
+               use_timestamp_for_validity=True, return_info=False, raise_errors=False,
+               **kwargs):
+        """
+        Verifies all signatures, content digests and certificate chains in the
+        SignedData structure.
+
+        When a SignerInfo contains an RFC 3161 timestamp token, the timestamp
+        is verified and, unless verification_time is explicitly provided, its
+        generation time is used to validate the signer certificate chain.
+
+        :param content:
+            None to use the encapsulated content, or a byte string containing
+            the detached content
+
+        :param trust_store:
+            None, or a certificate or iterable of certificates to use as trust
+            anchors. When None, the signer and timestamp certificates are
+            validated for time and signature but are not chained to an
+            externally trusted anchor.
+
+        :param extra_certs:
+            None, or additional certificates to use while building chains
+
+        :param verification_time:
+            None, a datetime or a POSIX timestamp at which to validate
+            certificate chains
+
+        :param require_timestamp:
+            A boolean indicating if every SignerInfo must contain a verified
+            timestamp
+
+        :param verify_timestamp:
+            A boolean indicating if timestamp tokens should be verified
+
+        :param timestamp_trust_store:
+            None, or trust anchors for timestamp signers. When None, trust_store
+            is used.
+
+        :param use_timestamp_for_validity:
+            A boolean indicating if the timestamp generation time should be used
+            to validate the signer certificate chain
+
+        :param return_info:
+            A boolean indicating if a CMSSignedDataVerificationResult should be
+            returned instead of True
+
+        :param raise_errors:
+            A boolean indicating if verification errors should be raised
+
+        :raises:
+            CMSVerificationError - when verification fails and return_info or
+            raise_errors is True
+
+        :return:
+            A boolean, or a CMSSignedDataVerificationResult object
+        """
+
+        content = _compat_kwarg(content, kwargs, ('data',))
+        trust_store = _compat_kwarg(
+            trust_store,
+            kwargs,
+            ('trusted_certs', 'trusted_certificates', 'trust_roots', 'trust_anchors', 'ca_certs', 'truststore')
+        )
+        extra_certs = _compat_kwarg(extra_certs, kwargs, ('intermediates',))
+        if kwargs:
+            raise TypeError('Unexpected keyword argument: %s' % sorted(kwargs.keys())[0])
+
+        try:
+            result = _verify_signed_data(
+                self,
+                content,
+                trust_store,
+                extra_certs,
+                verification_time,
+                require_timestamp,
+                verify_timestamp,
+                timestamp_trust_store,
+                use_timestamp_for_validity
+            )
+        except CMSVerificationError:
+            if return_info or raise_errors:
+                raise
+            return False
+        except (AttributeError, IndexError, KeyError, TypeError, ValueError) as e:
+            error = CMSVerificationError('Unable to verify SignedData: %s' % e)
+            if return_info or raise_errors:
+                raise error
+            return False
+
+        if return_info:
+            return result
+        return True
+
+    verify_signature = verify
+
+    def verify_timestamp(self, signer=0, trust_store=None, extra_certs=None, timestamp_trust_store=None):
+        """
+        Verifies the timestamp token of a SignerInfo.
+
+        :param signer:
+            An integer index into signer_infos, or a SignerInfo object
+
+        :param trust_store:
+            None, or trust anchors for the timestamp signer
+
+        :param extra_certs:
+            None, or additional certificates for chain building
+
+        :param timestamp_trust_store:
+            None, or timestamp-specific trust anchors
+
+        :raises:
+            CMSVerificationError - when the timestamp is missing or invalid
+
+        :return:
+            A CMSTimestampVerificationResult object
+        """
+
+        if isinstance(signer, int_types):
+            signer = self['signer_infos'][signer]
+        result = signer.verify_timestamp(trust_store, extra_certs, timestamp_trust_store)
+        if result is None:
+            raise CMSVerificationError('SignerInfo does not contain a timestamp token')
+        return result
+
+    def certificate_chain(self, signer=0, trust_store=None, extra_certs=None, verification_time=None):
+        """
+        Builds and verifies the certificate chain for a SignerInfo.
+
+        :param signer:
+            An integer index into signer_infos, or a SignerInfo object
+
+        :param trust_store:
+            A certificate or iterable of trust anchors
+
+        :param extra_certs:
+            None, or additional certificates for chain building
+
+        :param verification_time:
+            None, a datetime or a POSIX timestamp for validity checking
+
+        :raises:
+            CMSVerificationError - when the chain can not be verified
+
+        :return:
+            A list of asn1crypto.x509.Certificate objects, starting with the
+            signer certificate
+        """
+
+        if isinstance(signer, int_types):
+            signer = self['signer_infos'][signer]
+        candidates = _get_signed_data_certificates(self, extra_certs)
+        certificate = _find_signer_certificate(signer, candidates)
+        effective_time = _normalize_verification_time(verification_time)
+        return _verify_certificate_chain(certificate, candidates, trust_store, effective_time)
+
+    def verify_certificate_chain(self, signer=0, trust_store=None, extra_certs=None, verification_time=None):
+        """
+        Verifies the certificate chain for a SignerInfo and returns a boolean.
+        """
+
+        try:
+            self.certificate_chain(signer, trust_store, extra_certs, verification_time)
+        except CMSVerificationError:
+            return False
+        return True
+
+    verify_chain = verify_certificate_chain
 
 
 class OriginatorInfo(Sequence):
@@ -1006,3 +1335,732 @@ CMSAttribute._oid_specs = {
     'encrypt_key_pref': SMIMEEncryptionKeyPreferences,
     'smime_capabilities': SetOfSMIMECapabilites,
 }
+
+
+class _LoadedCertificate(object):
+
+    def __init__(self, asn1, crypto):
+        self.asn1 = asn1
+        self.crypto = crypto
+        self.der = asn1.dump()
+
+
+def _is_void(value):
+    return value is None or isinstance(value, Void)
+
+
+def _compat_kwarg(value, kwargs, names):
+    for name in names:
+        if name in kwargs:
+            alias_value = kwargs.pop(name)
+            if value is None:
+                value = alias_value
+    return value
+
+
+def _cryptography_x509():
+    try:
+        from cryptography import x509 as crypto_x509
+    except (ImportError):
+        raise CMSVerificationError(
+            'The cryptography package is required to verify CMS signatures'
+        )
+    return crypto_x509
+
+
+def _is_cryptography_certificate(value):
+    crypto_x509 = _cryptography_x509()
+    return isinstance(value, crypto_x509.Certificate)
+
+
+def _load_certificate(value):
+    if isinstance(value, _LoadedCertificate):
+        return value
+
+    if isinstance(value, CertificateChoices):
+        if value.name != 'certificate':
+            raise CMSVerificationError('CMS certificate choice does not contain an X.509 certificate')
+        value = value.chosen
+
+    crypto_x509 = _cryptography_x509()
+
+    if isinstance(value, Certificate):
+        asn1_certificate = value
+        der = value.dump()
+        crypto_certificate = crypto_x509.load_der_x509_certificate(der)
+        return _LoadedCertificate(asn1_certificate, crypto_certificate)
+
+    if isinstance(value, crypto_x509.Certificate):
+        der = value.public_bytes(_cryptography_encoding())
+        return _LoadedCertificate(Certificate.load(der), value)
+
+    if isinstance(value, bytearray):
+        value = bytes(value)
+
+    if isinstance(value, byte_cls):
+        try:
+            if value.lstrip().startswith(b'-----BEGIN'):
+                crypto_certificate = crypto_x509.load_pem_x509_certificate(value)
+                der = crypto_certificate.public_bytes(_cryptography_encoding())
+            else:
+                der = value
+                crypto_certificate = crypto_x509.load_der_x509_certificate(der)
+            return _LoadedCertificate(Certificate.load(der), crypto_certificate)
+        except (ValueError, TypeError) as e:
+            raise CMSVerificationError('Unable to parse certificate: %s' % e)
+
+    raise CMSVerificationError('Unsupported certificate value of type %s' % type(value).__name__)
+
+
+def _cryptography_encoding():
+    from cryptography.hazmat.primitives.serialization import Encoding
+    return Encoding.DER
+
+
+def _load_certificates(values):
+    if values is None:
+        return []
+
+    single_types = (_LoadedCertificate, CertificateChoices, Certificate)
+    is_single = isinstance(values, single_types) or isinstance(values, byte_cls)
+    if not is_single:
+        is_single = _is_cryptography_certificate(values)
+
+    if is_single:
+        values = [values]
+
+    try:
+        certificates = [_load_certificate(value) for value in values]
+    except TypeError:
+        raise CMSVerificationError('Certificates must be a certificate or an iterable of certificates')
+
+    output = []
+    seen = set()
+    for certificate in certificates:
+        if certificate.der in seen:
+            continue
+        seen.add(certificate.der)
+        output.append(certificate)
+    return output
+
+
+def _certificate_choices_to_certificates(certificates):
+    if _is_void(certificates):
+        return []
+    output = []
+    for choice in certificates:
+        if choice.name == 'certificate':
+            output.append(_load_certificate(choice))
+    return output
+
+
+def _get_signed_data_certificates(signed_data, extra_certs=None):
+    certificates = _certificate_choices_to_certificates(signed_data['certificates'])
+    if extra_certs is not None:
+        certificates.extend(_load_certificates(extra_certs))
+    return _load_certificates(certificates)
+
+
+def _find_signer_certificate(signer_info, certificates):
+    sid = signer_info['sid']
+    if sid.name == 'issuer_and_serial_number':
+        issuer_serial = sid.chosen
+        for certificate in certificates:
+            asn1_certificate = certificate.asn1
+            if asn1_certificate.issuer == issuer_serial['issuer'] and \
+                    asn1_certificate.serial_number == issuer_serial['serial_number'].native:
+                return certificate
+        raise CMSVerificationError('Unable to locate the signer certificate by issuer and serial number')
+
+    subject_key_identifier = sid.chosen.native
+    for certificate in certificates:
+        if certificate.asn1.key_identifier == subject_key_identifier:
+            return certificate
+    raise CMSVerificationError('Unable to locate the signer certificate by subject key identifier')
+
+
+def _attribute_values(attributes, attribute_type):
+    if _is_void(attributes):
+        return []
+    output = []
+    for attribute in attributes:
+        if attribute['type'].native == attribute_type:
+            values = attribute['values']
+            if not _is_void(values):
+                output.extend(list(values))
+    return output
+
+
+def _constant_time_equals(left, right):
+    if hasattr(hmac, 'compare_digest'):
+        return hmac.compare_digest(left, right)
+    if len(left) != len(right):
+        return False
+    result = 0
+    for left_byte, right_byte in zip(bytearray(left), bytearray(right)):
+        result |= left_byte ^ right_byte
+    return result == 0
+
+
+def _digest_bytes(hash_algo, data):
+    hash_name = hash_algo.replace('-', '_').lower()
+    try:
+        return hashlib.new(hash_name, data).digest()
+    except (ValueError, TypeError) as e:
+        raise CMSVerificationError('Unsupported digest algorithm %s: %s' % (hash_algo, e))
+
+
+def _signed_attributes_der(attributes):
+    encoded = attributes.dump()
+    tag = bytearray(encoded[:1])[0]
+    if tag != 0x31:
+        encoded = b'\x31' + encoded[1:]
+    return encoded
+
+
+def _content_bytes(content):
+    if _is_void(content):
+        raise CMSVerificationError('The signed content is not available')
+
+    if isinstance(content, bytearray):
+        return bytes(content)
+
+    if isinstance(content, byte_cls):
+        return content
+
+    if hasattr(content, '__bytes__'):
+        value = content.__bytes__()
+        if isinstance(value, byte_cls):
+            return value
+
+    value = content.native
+    if isinstance(value, byte_cls):
+        return value
+
+    raise CMSVerificationError('The signed content must be a byte string')
+
+
+def _encapsulated_content_bytes(signed_data):
+    return _content_bytes(signed_data['encap_content_info']['content'])
+
+
+def _crypto_hash_algorithm(hash_algo):
+    from cryptography.hazmat.primitives import hashes
+
+    hash_classes = {
+        'md5': getattr(hashes, 'MD5', None),
+        'sha1': getattr(hashes, 'SHA1', None),
+        'sha224': getattr(hashes, 'SHA224', None),
+        'sha256': getattr(hashes, 'SHA256', None),
+        'sha384': getattr(hashes, 'SHA384', None),
+        'sha512': getattr(hashes, 'SHA512', None),
+        'sha512_224': getattr(hashes, 'SHA512_224', None),
+        'sha512_256': getattr(hashes, 'SHA512_256', None),
+        'sha3_224': getattr(hashes, 'SHA3_224', None),
+        'sha3_256': getattr(hashes, 'SHA3_256', None),
+        'sha3_384': getattr(hashes, 'SHA3_384', None),
+        'sha3_512': getattr(hashes, 'SHA3_512', None),
+    }
+    hash_class = hash_classes.get(hash_algo.replace('-', '_').lower())
+    if hash_class is None:
+        raise CMSVerificationError('Unsupported digest algorithm %s' % hash_algo)
+    return hash_class()
+
+
+def _rsa_pss_padding(algorithm):
+    from cryptography.hazmat.primitives.asymmetric import padding
+
+    parameters = algorithm['parameters']
+    if _is_void(parameters):
+        raise CMSVerificationError('RSA-PSS parameters are missing')
+
+    hash_algo = parameters['hash_algorithm']['algorithm'].native
+    mgf_algorithm = parameters['mask_gen_algorithm']
+    if mgf_algorithm['algorithm'].native != 'mgf1':
+        raise CMSVerificationError('Unsupported RSA-PSS mask generation algorithm')
+    mgf_hash_algo = mgf_algorithm['parameters']['algorithm'].native
+    salt_length = parameters['salt_length'].native
+    if parameters['trailer_field'].native != 'trailer_field_bc':
+        raise CMSVerificationError('Unsupported RSA-PSS trailer field')
+
+    pss = padding.PSS(
+        mgf=padding.MGF1(_crypto_hash_algorithm(mgf_hash_algo)),
+        salt_length=salt_length
+    )
+    return pss, hash_algo
+
+
+def _signature_hash_name(signature_algorithm, digest_algo):
+    signature_algo = signature_algorithm.signature_algo
+    if signature_algo in ('ed25519', 'ed448'):
+        return None
+    if signature_algo == 'rsassa_pss':
+        _, hash_algo = _rsa_pss_padding(signature_algorithm)
+        return hash_algo
+
+    try:
+        return signature_algorithm.hash_algo
+    except ValueError:
+        return digest_algo
+
+
+def _verify_signature(public_key, signature, data, signature_algorithm, digest_algo):
+    from cryptography.exceptions import InvalidSignature
+    from cryptography.hazmat.primitives.asymmetric import dsa, ec, ed25519, ed448, padding, rsa
+
+    signature_algo = signature_algorithm.signature_algo
+    hash_algo = _signature_hash_name(signature_algorithm, digest_algo)
+    if hash_algo is not None and hash_algo != digest_algo:
+        raise CMSVerificationError(
+            'Signature digest algorithm %s does not match SignerInfo digest algorithm %s' %
+            (hash_algo, digest_algo)
+        )
+
+    try:
+        if signature_algo in ('rsassa_pkcs1v15', 'rsassa_pss'):
+            if not isinstance(public_key, rsa.RSAPublicKey):
+                raise CMSVerificationError('CMS signature algorithm requires an RSA public key')
+            hash_algorithm = _crypto_hash_algorithm(hash_algo)
+            if signature_algo == 'rsassa_pss':
+                pss, _ = _rsa_pss_padding(signature_algorithm)
+                public_key.verify(signature, data, pss, hash_algorithm)
+            else:
+                public_key.verify(signature, data, padding.PKCS1v15(), hash_algorithm)
+
+        elif signature_algo == 'ecdsa':
+            if not isinstance(public_key, ec.EllipticCurvePublicKey):
+                raise CMSVerificationError('CMS signature algorithm requires an EC public key')
+            public_key.verify(signature, data, ec.ECDSA(_crypto_hash_algorithm(hash_algo)))
+
+        elif signature_algo == 'dsa':
+            if not isinstance(public_key, dsa.DSAPublicKey):
+                raise CMSVerificationError('CMS signature algorithm requires a DSA public key')
+            public_key.verify(signature, data, _crypto_hash_algorithm(hash_algo))
+
+        elif signature_algo == 'ed25519':
+            if not isinstance(public_key, ed25519.Ed25519PublicKey):
+                raise CMSVerificationError('CMS signature algorithm requires an Ed25519 public key')
+            public_key.verify(signature, data)
+
+        elif signature_algo == 'ed448':
+            if not isinstance(public_key, ed448.Ed448PublicKey):
+                raise CMSVerificationError('CMS signature algorithm requires an Ed448 public key')
+            public_key.verify(signature, data)
+
+        else:
+            raise CMSVerificationError('Unsupported CMS signature algorithm %s' % signature_algo)
+
+    except InvalidSignature:
+        raise CMSVerificationError('CMS signature is invalid')
+    except (TypeError, ValueError) as e:
+        raise CMSVerificationError('Unable to verify CMS signature: %s' % e)
+
+
+def _verify_cms_algorithm_protection(signer_info):
+    attributes = signer_info['signed_attrs']
+    protections = _attribute_values(attributes, 'cms_algorithm_protection')
+    if len(protections) > 1:
+        raise CMSVerificationError('SignerInfo contains multiple CMS algorithm protection attributes')
+    if not protections:
+        return
+
+    protection = protections[0]
+    digest_algorithm = protection['digest_algorithm']
+    if digest_algorithm['algorithm'].dotted != signer_info['digest_algorithm']['algorithm'].dotted:
+        raise CMSVerificationError('CMS algorithm protection digest algorithm does not match SignerInfo')
+
+    protected_signature = protection['signature_algorithm']
+    protected_mac = protection['mac_algorithm']
+    if _is_void(protected_signature):
+        if _is_void(protected_mac):
+            raise CMSVerificationError('CMS algorithm protection contains neither a signature nor MAC algorithm')
+        raise CMSVerificationError('CMS algorithm protection MAC algorithm is not valid for SignedData')
+
+    if not _is_void(protected_mac):
+        raise CMSVerificationError('CMS algorithm protection contains both signature and MAC algorithms')
+
+    if protected_signature.dump() != signer_info['signature_algorithm'].dump():
+        raise CMSVerificationError('CMS algorithm protection signature algorithm does not match SignerInfo')
+
+
+def _verify_signer_crypto(signer_info, certificate, content, expected_content_type=None):
+    digest_algo = signer_info['digest_algorithm']['algorithm'].native
+    signed_attrs = signer_info['signed_attrs']
+
+    if _is_void(signed_attrs):
+        signed_data = content
+    else:
+        content_type_values = _attribute_values(signed_attrs, 'content_type')
+        if len(content_type_values) != 1:
+            raise CMSVerificationError('SignerInfo must contain exactly one content type signed attribute')
+        if expected_content_type is not None and content_type_values[0].native != expected_content_type:
+            raise CMSVerificationError('Signed attribute content type does not match encapsulated content')
+
+        message_digest_values = _attribute_values(signed_attrs, 'message_digest')
+        if len(message_digest_values) != 1:
+            raise CMSVerificationError('SignerInfo must contain exactly one message digest signed attribute')
+
+        expected_digest = message_digest_values[0].native
+        actual_digest = _digest_bytes(digest_algo, content)
+        if not _constant_time_equals(actual_digest, expected_digest):
+            raise CMSVerificationError('CMS message digest does not match the signed content')
+
+        signed_data = _signed_attributes_der(signed_attrs)
+
+    _verify_cms_algorithm_protection(signer_info)
+    _verify_signature(
+        certificate.crypto.public_key(),
+        signer_info['signature'].native,
+        signed_data,
+        signer_info['signature_algorithm'],
+        digest_algo
+    )
+
+
+def _normalize_verification_time(value):
+    if value is None:
+        return datetime.now(timezone.utc)
+
+    if isinstance(value, int_types):
+        return datetime.fromtimestamp(value, timezone.utc)
+
+    if not isinstance(value, datetime):
+        raise CMSVerificationError('verification_time must be a datetime or POSIX timestamp')
+
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _certificate_validity(certificate):
+    try:
+        return certificate.not_valid_before_utc, certificate.not_valid_after_utc
+    except AttributeError:
+        not_before = certificate.not_valid_before
+        not_after = certificate.not_valid_after
+        if not_before.tzinfo is None:
+            not_before = not_before.replace(tzinfo=timezone.utc)
+        if not_after.tzinfo is None:
+            not_after = not_after.replace(tzinfo=timezone.utc)
+        return not_before, not_after
+
+
+def _check_certificate_time(certificate, verification_time):
+    not_before, not_after = _certificate_validity(certificate.crypto)
+    if verification_time < not_before:
+        raise CMSVerificationError('Certificate is not valid yet')
+    if verification_time > not_after:
+        raise CMSVerificationError('Certificate has expired')
+
+
+def _check_leaf_key_usage(certificate):
+    key_usage = certificate.asn1.key_usage_value
+    if key_usage is None:
+        return
+    key_usage = key_usage.native
+    if 'digital_signature' not in key_usage and 'non_repudiation' not in key_usage:
+        raise CMSVerificationError('Signer certificate is not valid for digital signatures')
+
+
+def _check_issuer_usage(certificate, is_anchor):
+    basic_constraints = certificate.asn1.basic_constraints_value
+    if basic_constraints is None:
+        if not is_anchor:
+            raise CMSVerificationError('Certificate issuer is not a CA')
+    elif not basic_constraints['ca'].native:
+        raise CMSVerificationError('Certificate issuer is not a CA')
+
+    key_usage = certificate.asn1.key_usage_value
+    if key_usage is not None and 'key_cert_sign' not in key_usage.native:
+        raise CMSVerificationError('Certificate issuer is not valid for certificate signing')
+
+
+def _certificate_issued_by(certificate, issuer):
+    from cryptography.exceptions import InvalidSignature
+    from cryptography.hazmat.primitives.asymmetric import dsa, ec, ed25519, ed448, padding, rsa
+
+    public_key = issuer.crypto.public_key()
+    signature = certificate.crypto.signature
+    tbs_certificate = certificate.crypto.tbs_certificate_bytes
+    hash_algorithm = certificate.crypto.signature_hash_algorithm
+    parameters = getattr(certificate.crypto, 'signature_algorithm_parameters', None)
+
+    try:
+        if isinstance(public_key, rsa.RSAPublicKey):
+            if isinstance(parameters, padding.PSS):
+                public_key.verify(signature, tbs_certificate, parameters, hash_algorithm)
+            elif certificate.asn1['signature_algorithm']['algorithm'].native == 'rsassa_pss':
+                pss, _ = _rsa_pss_padding(certificate.asn1['signature_algorithm'])
+                public_key.verify(signature, tbs_certificate, pss, hash_algorithm)
+            else:
+                public_key.verify(signature, tbs_certificate, padding.PKCS1v15(), hash_algorithm)
+
+        elif isinstance(public_key, ec.EllipticCurvePublicKey):
+            if not isinstance(parameters, ec.ECDSA):
+                parameters = ec.ECDSA(hash_algorithm)
+            public_key.verify(signature, tbs_certificate, parameters)
+
+        elif isinstance(public_key, dsa.DSAPublicKey):
+            public_key.verify(signature, tbs_certificate, hash_algorithm)
+
+        elif isinstance(public_key, (ed25519.Ed25519PublicKey, ed448.Ed448PublicKey)):
+            public_key.verify(signature, tbs_certificate)
+
+        else:
+            raise CMSVerificationError('Unsupported certificate public key type')
+
+    except InvalidSignature:
+        raise CMSVerificationError('Certificate signature is invalid')
+    except (TypeError, ValueError) as e:
+        raise CMSVerificationError('Unable to verify certificate signature: %s' % e)
+
+
+def _check_path_lengths(chain):
+    for index, certificate in enumerate(chain[1:], 1):
+        basic_constraints = certificate.asn1.basic_constraints_value
+        if basic_constraints is None:
+            continue
+        path_length = basic_constraints['path_len_constraint'].native
+        if path_length is None:
+            continue
+        subordinate_cas = 0
+        for subordinate in chain[1:index]:
+            if subordinate.asn1.ca:
+                subordinate_cas += 1
+        if subordinate_cas > path_length:
+            raise CMSVerificationError('Certificate chain exceeds a CA path length constraint')
+
+
+def _verify_certificate_chain(certificate, candidates, trust_store, verification_time):
+    anchor_required = trust_store is not None
+    anchors = _load_certificates(trust_store)
+    if anchor_required and not anchors:
+        raise CMSVerificationError('No trust anchors were provided')
+
+    all_candidates = _load_certificates(list(candidates) + anchors)
+    anchor_ders = set(anchor.der for anchor in anchors)
+
+    _check_certificate_time(certificate, verification_time)
+    _check_leaf_key_usage(certificate)
+
+    if not anchor_required:
+        return [certificate.asn1]
+
+    chain = [certificate]
+    if certificate.der in anchor_ders:
+        return [item.asn1 for item in chain]
+
+    while len(chain) <= 20:
+        current = chain[-1]
+        issuer = None
+        for candidate in all_candidates:
+            if candidate.der == current.der:
+                continue
+            if candidate.crypto.subject != current.crypto.issuer:
+                continue
+            try:
+                _certificate_issued_by(current, candidate)
+                _check_certificate_time(candidate, verification_time)
+                _check_issuer_usage(candidate, candidate.der in anchor_ders)
+            except CMSVerificationError:
+                continue
+            issuer = candidate
+            break
+
+        if issuer is None:
+            raise CMSVerificationError('Unable to build a certificate chain to a trusted root')
+
+        chain.append(issuer)
+
+        if issuer.der in anchor_ders:
+            _check_path_lengths(chain)
+            return [item.asn1 for item in chain]
+
+    raise CMSVerificationError('Certificate chain is too long')
+
+
+def _verify_timestamp_token(signer_info, token, trust_store, extra_certs):
+    if token['content_type'].native != 'signed_data':
+        raise CMSVerificationError('Timestamp token does not contain SignedData')
+
+    from . import tsp
+
+    timestamp_signed_data = token['content']
+    encap_content_info = timestamp_signed_data['encap_content_info']
+    if encap_content_info['content_type'].native != 'tst_info':
+        raise CMSVerificationError('Timestamp token does not contain TSTInfo')
+
+    timestamp_content = _content_bytes(encap_content_info['content'])
+    tst_info = encap_content_info['content'].parsed
+    if not isinstance(tst_info, tsp.TSTInfo):
+        tst_info = tsp.TSTInfo.load(timestamp_content)
+
+    if tst_info['version'].native != 'v1':
+        raise CMSVerificationError('Unsupported TSTInfo version')
+
+    gen_time = _normalize_verification_time(tst_info['gen_time'].native)
+    timestamp_result = _verify_signed_data(
+        timestamp_signed_data,
+        timestamp_content,
+        trust_store,
+        extra_certs,
+        gen_time,
+        False,
+        False,
+        None,
+        False
+    )
+
+    if not timestamp_result.signers:
+        raise CMSVerificationError('Timestamp token does not contain a signer')
+
+    message_imprint = tst_info['message_imprint']
+    imprint_algorithm = message_imprint['hash_algorithm']['algorithm'].native
+    expected_imprint = message_imprint['hashed_message'].native
+    actual_imprint = _digest_bytes(imprint_algorithm, signer_info['signature'].native)
+    if not _constant_time_equals(actual_imprint, expected_imprint):
+        raise CMSVerificationError('Timestamp message imprint does not match the SignerInfo signature')
+
+    timestamp_signer = timestamp_result.signers[0]
+    return CMSTimestampVerificationResult(
+        gen_time,
+        tst_info['policy'].dotted,
+        tst_info['serial_number'].native,
+        tst_info['tsa'].native,
+        tst_info,
+        timestamp_signed_data,
+        timestamp_signer.certificate,
+        timestamp_signer.certificate_chain
+    )
+
+
+def _verify_signed_data(signed_data, content, trust_store, extra_certs, verification_time,
+                        require_timestamp, verify_timestamp, timestamp_trust_store,
+                        use_timestamp_for_validity):
+    if content is None:
+        content = _encapsulated_content_bytes(signed_data)
+    else:
+        content = _content_bytes(content)
+
+    anchors = _load_certificates(trust_store)
+    candidates = _get_signed_data_certificates(signed_data, extra_certs)
+    candidates = _load_certificates(candidates + anchors)
+
+    signer_results = []
+    signer_infos = signed_data['signer_infos']
+    if len(signer_infos) == 0:
+        raise CMSVerificationError('SignedData does not contain any signers')
+
+    for signer_info in signer_infos:
+        certificate = _find_signer_certificate(signer_info, candidates)
+        expected_content_type = signed_data['encap_content_info']['content_type'].native
+        _verify_signer_crypto(signer_info, certificate, content, expected_content_type)
+
+        timestamp = None
+        timestamp_values = _attribute_values(signer_info['unsigned_attrs'], 'signature_time_stamp_token')
+        if len(timestamp_values) > 1:
+            raise CMSVerificationError('SignerInfo contains more than one timestamp token')
+        if timestamp_values:
+            if verify_timestamp:
+                timestamp_anchors = timestamp_trust_store if timestamp_trust_store is not None else trust_store
+                timestamp = _verify_timestamp_token(
+                    signer_info,
+                    timestamp_values[0],
+                    timestamp_anchors,
+                    extra_certs
+                )
+        elif require_timestamp:
+            raise CMSVerificationError('SignerInfo does not contain a timestamp token')
+
+        if verification_time is not None:
+            effective_time = _normalize_verification_time(verification_time)
+        elif timestamp is not None and use_timestamp_for_validity:
+            effective_time = timestamp.gen_time
+        else:
+            effective_time = _normalize_verification_time(None)
+
+        chain = _verify_certificate_chain(certificate, candidates, trust_store, effective_time)
+        signer_results.append(
+            CMSSignerVerificationResult(
+                signer_info,
+                certificate.asn1,
+                chain,
+                timestamp,
+                effective_time
+            )
+        )
+
+    return CMSSignedDataVerificationResult(signer_results)
+
+
+def verify_signed_data(signed_data, content=None, trust_store=None, extra_certs=None,
+                       verification_time=None, require_timestamp=False, verify_timestamp=True,
+                       timestamp_trust_store=None, use_timestamp_for_validity=True,
+                       return_info=False, raise_errors=False, **kwargs):
+    """
+    Convenience wrapper around SignedData.verify().
+    """
+
+    return signed_data.verify(
+        content,
+        trust_store,
+        extra_certs,
+        verification_time,
+        require_timestamp,
+        verify_timestamp,
+        timestamp_trust_store,
+        use_timestamp_for_validity,
+        return_info,
+        raise_errors,
+        **kwargs
+    )
+
+
+def verify_timestamp_token(token, signer_info, trust_store=None, extra_certs=None):
+    """
+    Verifies an RFC 3161 timestamp token against the signature of a SignerInfo.
+
+    :param token:
+        A cms.ContentInfo object containing SignedData with TSTInfo
+
+    :param signer_info:
+        The cms.SignerInfo whose signature is covered by the timestamp
+
+    :raises:
+        CMSVerificationError - when the timestamp is invalid
+
+    :return:
+        A CMSTimestampVerificationResult object
+    """
+
+    return _verify_timestamp_token(signer_info, token, trust_store, extra_certs)
+
+
+def verify_certificate_chain(certificate, trust_store, intermediates=None,
+                             verification_time=None):
+    """
+    Builds and verifies a certificate chain.
+
+    :param certificate:
+        The end-entity certificate
+
+    :param trust_store:
+        A certificate or iterable of trust anchors
+
+    :param intermediates:
+        None, or a certificate or iterable of intermediate certificates
+
+    :param verification_time:
+        None, a datetime or POSIX timestamp for validity checking
+
+    :raises:
+        CMSVerificationError - when the chain can not be verified
+
+    :return:
+        A list of asn1crypto.x509.Certificate objects, starting with certificate
+    """
+
+    leaf = _load_certificate(certificate)
+    candidates = [leaf] + _load_certificates(intermediates)
+    effective_time = _normalize_verification_time(verification_time)
+    return _verify_certificate_chain(leaf, candidates, trust_store, effective_time)

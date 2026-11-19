@@ -5,9 +5,10 @@ import unittest
 import os
 import zlib
 import sys
-from datetime import datetime
+import hashlib
+from datetime import datetime, timedelta
 
-from asn1crypto import cms, util
+from asn1crypto import cms, tsp, util, x509
 from ._unittest_compat import patch
 
 patch()
@@ -1038,4 +1039,351 @@ class CMSTests(unittest.TestCase):
         self.assertEqual(
             'recipient_key_id',
             old_sekp.name,
+        )
+
+
+class _CMSVerificationFixture(object):
+
+    def __init__(self):
+        from cryptography import x509 as crypto_x509
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.x509.oid import NameOID
+
+        self._crypto_x509 = crypto_x509
+        self._hashes = hashes
+        self._serialization = serialization
+        self._name_oid = NameOID
+        self._serial = 0
+        self.now = datetime.now(util.timezone.utc)
+        self.content = b'CMS signature verification fixture'
+
+        self.root_key = self._key()
+        self.root_name = self._name('CMS Test Root')
+        self.root = self._certificate(
+            self.root_name,
+            self.root_name,
+            self.root_key.public_key(),
+            self.root_key,
+            True,
+            self.now - timedelta(days=900),
+            self.now + timedelta(days=900)
+        )
+
+        self.inter_key = self._key()
+        self.inter_name = self._name('CMS Test Intermediate')
+        self.inter = self._certificate(
+            self.inter_name,
+            self.root_name,
+            self.inter_key.public_key(),
+            self.root_key,
+            True,
+            self.now - timedelta(days=800),
+            self.now + timedelta(days=800)
+        )
+
+        self.leaf_key = self._key()
+        self.leaf_name = self._name('CMS Test Signer')
+        self.leaf = self._certificate(
+            self.leaf_name,
+            self.inter_name,
+            self.leaf_key.public_key(),
+            self.inter_key,
+            False,
+            self.now - timedelta(days=30),
+            self.now + timedelta(days=300)
+        )
+
+        self.expired_leaf_key = self._key()
+        self.expired_leaf_name = self._name('CMS Expired Signer')
+        self.expired_leaf = self._certificate(
+            self.expired_leaf_name,
+            self.inter_name,
+            self.expired_leaf_key.public_key(),
+            self.inter_key,
+            False,
+            self.now - timedelta(days=400),
+            self.now - timedelta(days=365)
+        )
+        self.historical_time = self.now - timedelta(days=370)
+
+        self.tsa_key = self._key()
+        self.tsa_name = self._name('CMS Test TSA')
+        self.tsa = self._certificate(
+            self.tsa_name,
+            self.root_name,
+            self.tsa_key.public_key(),
+            self.root_key,
+            False,
+            self.now - timedelta(days=800),
+            self.now + timedelta(days=800)
+        )
+
+        self.other_root_key = self._key()
+        self.other_root_name = self._name('CMS Untrusted Root')
+        self.other_root = self._certificate(
+            self.other_root_name,
+            self.other_root_name,
+            self.other_root_key.public_key(),
+            self.other_root_key,
+            True,
+            self.now - timedelta(days=900),
+            self.now + timedelta(days=900)
+        )
+
+    def _key(self):
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        return rsa.generate_private_key(public_exponent=65537, key_size=2048)
+
+    def _name(self, common_name):
+        return self._crypto_x509.Name([
+            self._crypto_x509.NameAttribute(self._name_oid.COMMON_NAME, common_name)
+        ])
+
+    def _certificate(self, subject, issuer, public_key, issuer_key, ca, not_before, not_after):
+        self._serial += 1
+        builder = self._crypto_x509.CertificateBuilder()
+        builder = builder.subject_name(subject)
+        builder = builder.issuer_name(issuer)
+        builder = builder.public_key(public_key)
+        builder = builder.serial_number(self._serial)
+        builder = builder.not_valid_before(not_before)
+        builder = builder.not_valid_after(not_after)
+        builder = builder.add_extension(
+            self._crypto_x509.BasicConstraints(ca=ca, path_length=None),
+            critical=True
+        )
+        builder = builder.add_extension(
+            self._crypto_x509.KeyUsage(
+                digital_signature=True,
+                content_commitment=False,
+                key_encipherment=False,
+                data_encipherment=False,
+                key_agreement=False,
+                key_cert_sign=ca,
+                crl_sign=ca,
+                encipher_only=False,
+                decipher_only=False
+            ),
+            critical=True
+        )
+        certificate = builder.sign(issuer_key, self._hashes.SHA256())
+        der = certificate.public_bytes(self._serialization.Encoding.DER)
+        return x509.Certificate.load(der)
+
+    def _timestamp_token(self, signature, timestamp_time):
+        tst_info = tsp.TSTInfo({
+            'version': 'v1',
+            'policy': '1.2.3.4',
+            'message_imprint': {
+                'hash_algorithm': {'algorithm': 'sha256'},
+                'hashed_message': hashlib.sha256(signature).digest(),
+            },
+            'serial_number': 1,
+            'gen_time': timestamp_time,
+        })
+        tst_info_bytes = tst_info.dump()
+
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.asymmetric import padding
+        signature = self.tsa_key.sign(tst_info_bytes, padding.PKCS1v15(), hashes.SHA256())
+
+        signed_data = cms.SignedData({
+            'version': 'v3',
+            'digest_algorithms': [{'algorithm': 'sha256'}],
+            'encap_content_info': {
+                'content_type': 'tst_info',
+                'content': tst_info,
+            },
+            'certificates': [self.tsa],
+            'signer_infos': [
+                {
+                    'version': 'v1',
+                    'sid': {
+                        'issuer_and_serial_number': {
+                            'issuer': self.tsa.issuer,
+                            'serial_number': self.tsa.serial_number,
+                        }
+                    },
+                    'digest_algorithm': {'algorithm': 'sha256'},
+                    'signature_algorithm': {'algorithm': 'sha256_rsa'},
+                    'signature': signature,
+                }
+            ],
+        })
+        return cms.ContentInfo({
+            'content_type': 'signed_data',
+            'content': signed_data,
+        })
+
+    def signed_data(self, expired=False, with_timestamp=False, include_intermediate=True,
+                    timestamp_time=None):
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.asymmetric import padding
+
+        if expired:
+            signing_key = self.expired_leaf_key
+            signer_certificate = self.expired_leaf
+        else:
+            signing_key = self.leaf_key
+            signer_certificate = self.leaf
+
+        signed_attrs = cms.CMSAttributes([
+            cms.CMSAttribute({'type': 'content_type', 'values': ['data']}),
+            cms.CMSAttribute({
+                'type': 'message_digest',
+                'values': [hashlib.sha256(self.content).digest()],
+            }),
+        ])
+        signed_attrs_der = b'\x31' + signed_attrs.dump()[1:]
+        signature = signing_key.sign(signed_attrs_der, padding.PKCS1v15(), hashes.SHA256())
+
+        signer_info = {
+            'version': 'v1',
+            'sid': {
+                'issuer_and_serial_number': {
+                    'issuer': signer_certificate.issuer,
+                    'serial_number': signer_certificate.serial_number,
+                }
+            },
+            'digest_algorithm': {'algorithm': 'sha256'},
+            'signed_attrs': signed_attrs,
+            'signature_algorithm': {'algorithm': 'sha256_rsa'},
+            'signature': signature,
+        }
+
+        if with_timestamp:
+            if timestamp_time is None:
+                timestamp_time = self.now
+            token = self._timestamp_token(signature, timestamp_time)
+            signer_info['unsigned_attrs'] = cms.CMSAttributes([
+                cms.CMSAttribute({
+                    'type': 'signature_time_stamp_token',
+                    'values': [token],
+                })
+            ])
+
+        certificates = [signer_certificate]
+        if include_intermediate:
+            certificates.append(self.inter)
+
+        return cms.SignedData({
+            'version': 'v1',
+            'digest_algorithms': [{'algorithm': 'sha256'}],
+            'encap_content_info': {
+                'content_type': 'data',
+                'content': self.content,
+            },
+            'certificates': certificates,
+            'signer_infos': [signer_info],
+        })
+
+
+class CMSSignatureVerificationTests(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            cls.fixture = _CMSVerificationFixture()
+        except ImportError as e:
+            raise unittest.SkipTest('cryptography is not available: %s' % e)
+
+    def test_verify_signed_data_with_certificate_chain(self):
+        signed_data = self.fixture.signed_data()
+        result = signed_data.verify(
+            trust_store=self.fixture.root,
+            return_info=True
+        )
+
+        self.assertEqual(
+            ['CMS Test Signer', 'CMS Test Intermediate', 'CMS Test Root'],
+            [cert.subject.native['common_name'] for cert in result.signers[0].certificate_chain]
+        )
+        self.assertEqual(
+            ['CMS Test Signer', 'CMS Test Intermediate', 'CMS Test Root'],
+            [
+                cert.subject.native['common_name']
+                for cert in signed_data.certificate_chain(trust_store=self.fixture.root)
+            ]
+        )
+        self.assertTrue(
+            signed_data.verify_certificate_chain(trust_store=self.fixture.root)
+        )
+        self.assertTrue(signed_data.verify(trust_store=self.fixture.root))
+
+    def test_tampered_content_fails(self):
+        signed_data = self.fixture.signed_data()
+        self.assertFalse(
+            signed_data.verify(
+                content=b'CMS signature verification fixture!',
+                trust_store=self.fixture.root
+            )
+        )
+
+    def test_tampered_signature_fails(self):
+        signed_data = self.fixture.signed_data()
+        signer_info = signed_data['signer_infos'][0]
+        signature = bytearray(signer_info['signature'].native)
+        signature = byte_cls(bytearray([signature[0] ^ 0x01])) + signature[1:]
+        signer_info['signature'] = signature
+
+        self.assertFalse(signed_data.verify(trust_store=self.fixture.root))
+
+    def test_expired_signature_fails(self):
+        signed_data = self.fixture.signed_data(expired=True)
+        self.assertFalse(signed_data.verify(trust_store=self.fixture.root))
+
+    def test_valid_timestamp_allows_historically_valid_signature(self):
+        signed_data = self.fixture.signed_data(
+            expired=True,
+            with_timestamp=True,
+            timestamp_time=self.fixture.historical_time
+        )
+        result = signed_data.verify(
+            trust_store=self.fixture.root,
+            return_info=True
+        )
+
+        self.assertEqual(
+            self.fixture.historical_time,
+            result.timestamp.gen_time
+        )
+        self.assertEqual('CMS Test TSA', result.timestamp.certificate_chain[0].subject.native['common_name'])
+        self.assertEqual(
+            self.fixture.historical_time,
+            signed_data.verify_timestamp(trust_store=self.fixture.root).gen_time
+        )
+
+    def test_tampered_timestamp_fails(self):
+        signed_data = self.fixture.signed_data(with_timestamp=True)
+        timestamp = signed_data['signer_infos'][0]['unsigned_attrs'][0]['values'][0]
+        timestamp_signer = timestamp['content']['signer_infos'][0]
+        signature = bytearray(timestamp_signer['signature'].native)
+        signature = byte_cls(bytearray([signature[0] ^ 0x01])) + signature[1:]
+        timestamp_signer['signature'] = signature
+
+        self.assertFalse(signed_data.verify(trust_store=self.fixture.root))
+
+    def test_missing_intermediate_fails(self):
+        signed_data = self.fixture.signed_data(include_intermediate=False)
+        self.assertFalse(signed_data.verify(trust_store=self.fixture.root))
+
+    def test_untrusted_root_fails(self):
+        signed_data = self.fixture.signed_data()
+        self.assertFalse(signed_data.verify(trust_store=self.fixture.other_root))
+
+    def test_require_timestamp(self):
+        without_timestamp = self.fixture.signed_data()
+        with_timestamp = self.fixture.signed_data(with_timestamp=True)
+
+        self.assertFalse(
+            without_timestamp.verify(
+                trust_store=self.fixture.root,
+                require_timestamp=True
+            )
+        )
+        self.assertTrue(
+            with_timestamp.verify(
+                trust_store=self.fixture.root,
+                require_timestamp=True
+            )
         )

@@ -57,6 +57,17 @@ a bunch of ASN.1 structures for use with various common cryptography standards:
 | TSP                    | [`asn1crypto.tsp`](asn1crypto/tsp.py)       | [RFC 3161](https://tools.ietf.org/html/rfc3161)                                                                        |
 | PDF signatures         | [`asn1crypto.pdf`](asn1crypto/pdf.py)       | [PDF 1.7](http://wwwimages.adobe.com/content/dam/Adobe/en/devnet/pdf/pdfs/PDF32000_2008.pdf)                           |
 
+CMS `SignedData` signature verification, certificate chain validation and
+RFC 3161 timestamp validation are available via `SignedData.verify()`. These
+checks require the optional [cryptography](https://cryptography.io/) package.
+
+```python
+from asn1crypto import cms
+
+signed_data = cms.ContentInfo.load(der_bytes)['content']
+is_valid = signed_data.verify(trust_store=[trusted_root_certificate])
+```
+
 ## Why Another Python ASN.1 Library?
 
 Python has long had the [pyasn1](https://pypi.org/project/pyasn1/) and
@@ -130,7 +141,8 @@ faster to an order of magnitude or more.
 ## Dependencies
 
 Python 2.6, 2.7, 3.2, 3.3, 3.4, 3.5, 3.6, 3.7, 3.8, 3.9, 3.10, 3.11, 3.12, 3.13, 3.14 or pypy.
-*No third-party packages required.*
+*No third-party packages are required for ASN.1 parsing. CMS signature
+verification requires the optional `cryptography` package.*
 
 ## Installation
 
